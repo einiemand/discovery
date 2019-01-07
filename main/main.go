@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 
+	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
 	"github.com/olivere/elastic"
@@ -21,9 +22,13 @@ const (
 	POST_TYPE  = "post"
 	DISTANCE   = "200km"
 
-	ES_URL          = "http://35.230.14.141:9200/"
+	ES_URL          = "http://35.197.19.143:9200/"
 	BUCKET_NAME     = "discovery-post-images"
-	CREDENTIAL_PATH = "../credentials/Discovery-0e775b4e419c.json"
+	CREDENTIAL_PATH = "Discovery-0e775b4e419c.json"
+
+	PROJECT_ID      = "discovery-225722"
+	BT_INSTANCE     = "discovery-post"
+	ENABLE_BIGTABLE = true
 )
 
 type Location struct {
@@ -72,6 +77,31 @@ func createIndexIfNotExists() {
 			panic(err)
 		}
 	}
+}
+
+// Save a post to BigTable
+func saveToBigTable(p *Post, id string) {
+	ctx := context.Background()
+	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE, option.WithCredentialsFile(CREDENTIAL_PATH))
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	tbl := bt_client.Open("post")
+	mut := bigtable.NewMutation()
+	t := bigtable.Now()
+	mut.Set("post", "user", t, []byte(p.User))
+	mut.Set("post", "message", t, []byte(p.Message))
+	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+	err = tbl.Apply(ctx, id, mut)
+	if err != nil {
+		panic(err)
+		return
+	}
+	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
 }
 
 func saveToGCS(reader io.Reader, bucketName, objectName string) (*storage.ObjectAttrs, error) {
@@ -183,7 +213,7 @@ func postHandler(writer http.ResponseWriter, req *http.Request) {
 	id := uuid.New().String()
 	attrs, err := saveToGCS(img, BUCKET_NAME, id)
 	if err != nil {
-		http.Error(writer, "Failed to save image to GCS", http.StatusInternalServerError)
+		http.Error(writer, "Failed to save image to GCS: "+err.Error(), http.StatusInternalServerError)
 		fmt.Printf("Failed to save image to GCS %v.\n", err)
 		return
 	}
@@ -205,6 +235,10 @@ func postHandler(writer http.ResponseWriter, req *http.Request) {
 		return
 	}
 	fmt.Printf("Saved one post to ElasticSearch: %s\n", post.Message)
+
+	if ENABLE_BIGTABLE {
+		saveToBigTable(post, id)
+	}
 
 }
 
