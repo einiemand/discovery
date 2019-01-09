@@ -12,4 +12,4 @@
 *.out
 
 main/*.json
-credentials/*
+credentials/*.json

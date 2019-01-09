@@ -8,11 +8,16 @@ import (
 	"log"
 	"net/http"
 	"reflect"
+	"regexp"
 	"strconv"
+	"time"
 
 	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/storage"
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
+	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"github.com/olivere/elastic"
 	"google.golang.org/api/option"
 )
@@ -22,13 +27,13 @@ const (
 	POST_TYPE  = "post"
 	DISTANCE   = "200km"
 
-	ES_URL          = "http://35.197.19.143:9200/"
+	ES_URL          = "http://35.247.64.8:9200/"
 	BUCKET_NAME     = "discovery-post-images"
 	CREDENTIAL_PATH = "Discovery-0e775b4e419c.json"
 
 	PROJECT_ID      = "discovery-225722"
 	BT_INSTANCE     = "discovery-post"
-	ENABLE_BIGTABLE = true
+	ENABLE_BIGTABLE = false
 )
 
 type Location struct {
@@ -45,10 +50,175 @@ type Post struct {
 
 func main() {
 	createIndexIfNotExists()
-	http.HandleFunc("/post", postHandler)
-	http.HandleFunc("/search", searchHandler)
+	jwtMiddleware := jwtmiddleware.New(jwtmiddleware.Options{
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return []byte(mySigningKey), nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r := mux.NewRouter()
+
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(postHandler))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(searchHandler))).Methods("GET")
+	r.Handle("/register", http.HandlerFunc(registerHandler)).Methods("POST")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+
+	http.Handle("/", r)
+
 	fmt.Println("started-service")
 	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func loginHandler(writer http.ResponseWriter, req *http.Request) {
+	fmt.Println("Received one login request")
+	writer.Header().Set("Content-Type", "text/plain")
+	writer.Header().Set("Access-Control-Allow-Origin", "*")
+
+	decoder := json.NewDecoder(req.Body)
+	var user User
+	if err := decoder.Decode(&user); err != nil {
+		http.Error(writer, "Invalid JSON format", http.StatusBadRequest)
+		fmt.Printf("Invalid JSON format: %v\n", err)
+		return
+	}
+
+	if err := verifyUser(user.Username, user.Password); err != nil {
+		if err.Error() == "Invalid username or password" {
+			http.Error(writer, err.Error(), http.StatusUnauthorized)
+		} else {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"username": user.Username,
+		"exp":      time.Now().Add(time.Minute * 10).Unix(),
+	})
+	tokenString, err := token.SignedString(mySigningKey)
+	if err != nil {
+		http.Error(writer, "Failed to generate token", http.StatusInternalServerError)
+		fmt.Printf("Failed to generate token: %v\n", err)
+		return
+	}
+	writer.Write([]byte(tokenString))
+}
+
+func registerHandler(writer http.ResponseWriter, req *http.Request) {
+	fmt.Println("Received one register request")
+	writer.Header().Set("Content-Type", "text/plain")
+	writer.Header().Set("Access-Control-Allow-Origin", "*")
+
+	decoder := json.NewDecoder(req.Body)
+	var user User
+	if err := decoder.Decode(&user); err != nil {
+		http.Error(writer, "Invalid JSON format", http.StatusBadRequest)
+		fmt.Printf("Invalid JSON format: %v\n", err)
+		return
+	}
+
+	if !regexp.MustCompile(`^[a-zA-Z0-9_]$`).MatchString(user.Username) || user.Password == "" {
+		http.Error(writer, "Wrong username or password format", http.StatusBadRequest)
+		fmt.Println("Wrong username or password format")
+		return
+	}
+
+	if err := registerUser(user); err != nil {
+		if err.Error() == "Username already exists" {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+		} else {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	writer.Write([]byte("Successfully registered user: " + user.Username))
+}
+
+func postHandler(writer http.ResponseWriter, req *http.Request) {
+	fmt.Println("Received one post request.")
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Access-Control-Allow-Origin", "*")
+	writer.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	user := req.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
+	lat, _ := strconv.ParseFloat(req.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(req.FormValue("lon"), 64)
+
+	img, _, err := req.FormFile("image")
+	if err != nil {
+		http.Error(writer, "Image is not available", http.StatusBadRequest)
+		fmt.Printf("Image is not available %v.\n", err)
+		return
+	}
+
+	id := uuid.New().String()
+	attrs, err := saveToGCS(img, BUCKET_NAME, id)
+	if err != nil {
+		http.Error(writer, "Failed to save image to GCS: "+err.Error(), http.StatusInternalServerError)
+		fmt.Printf("Failed to save image to GCS %v.\n", err)
+		return
+	}
+
+	post := &Post{
+		User:    username.(string),
+		Message: req.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
+		Url: attrs.MediaLink,
+	}
+
+	err = saveToES(post, id)
+	if err != nil {
+		http.Error(writer, "Failed to save post to ElasticSearch", http.StatusInternalServerError)
+		fmt.Printf("Failed to save post to ElasticSearch %v.\n", err)
+		return
+	}
+	fmt.Printf("Saved one post to ElasticSearch: %s\n", post.Message)
+
+	if ENABLE_BIGTABLE {
+		saveToBigTable(post, id)
+	}
+
+}
+
+func searchHandler(writer http.ResponseWriter, req *http.Request) {
+	fmt.Println("Received one request for search")
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Access-Control-Allow-Origin", "*")
+	writer.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	lat, _ := strconv.ParseFloat(req.URL.Query().Get("lat"), 64)
+	lon, _ := strconv.ParseFloat(req.URL.Query().Get("lon"), 64)
+	// range is optional
+	ran := DISTANCE
+	if val := req.URL.Query().Get("range"); val != "" {
+		ran = val + "km"
+	}
+
+	posts, err := readFromES(lat, lon, ran)
+	if err != nil {
+		http.Error(writer, "Failed to read post from ElasticSearch", http.StatusInternalServerError)
+		fmt.Printf("Failed to read post from ElasticSearch %v.\n", err)
+		return
+	}
+
+	js, err := json.Marshal(posts)
+	if err != nil {
+		http.Error(writer, "Failed to parse posts into JSON format", http.StatusInternalServerError)
+		fmt.Printf("Failed to parse posts into JSON format %v.\n", err)
+		return
+	}
+
+	writer.Write(js)
 }
 
 func createIndexIfNotExists() {
@@ -77,6 +247,19 @@ func createIndexIfNotExists() {
 			panic(err)
 		}
 	}
+
+	exists, err = client.IndexExists(USER_INDEX).Do(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	if !exists {
+		_, err = client.CreateIndex(USER_INDEX).Do(context.Background())
+		if err != nil {
+			panic(err)
+		}
+	}
+
 }
 
 // Save a post to BigTable
@@ -191,85 +374,4 @@ func readFromES(lat, lon float64, ran string) ([]Post, error) {
 	}
 
 	return posts, nil
-}
-
-func postHandler(writer http.ResponseWriter, req *http.Request) {
-	fmt.Println("Received one post request.")
-
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("Access-Control-Allow-Origin", "*")
-	writer.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
-
-	lat, _ := strconv.ParseFloat(req.FormValue("lat"), 64)
-	lon, _ := strconv.ParseFloat(req.FormValue("lon"), 64)
-
-	img, _, err := req.FormFile("image")
-	if err != nil {
-		http.Error(writer, "Image is not available", http.StatusBadRequest)
-		fmt.Printf("Image is not available %v.\n", err)
-		return
-	}
-
-	id := uuid.New().String()
-	attrs, err := saveToGCS(img, BUCKET_NAME, id)
-	if err != nil {
-		http.Error(writer, "Failed to save image to GCS: "+err.Error(), http.StatusInternalServerError)
-		fmt.Printf("Failed to save image to GCS %v.\n", err)
-		return
-	}
-
-	post := &Post{
-		User:    req.FormValue("user"),
-		Message: req.FormValue("message"),
-		Location: Location{
-			Lat: lat,
-			Lon: lon,
-		},
-		Url: attrs.MediaLink,
-	}
-
-	err = saveToES(post, id)
-	if err != nil {
-		http.Error(writer, "Failed to save post to ElasticSearch", http.StatusInternalServerError)
-		fmt.Printf("Failed to save post to ElasticSearch %v.\n", err)
-		return
-	}
-	fmt.Printf("Saved one post to ElasticSearch: %s\n", post.Message)
-
-	if ENABLE_BIGTABLE {
-		saveToBigTable(post, id)
-	}
-
-}
-
-func searchHandler(writer http.ResponseWriter, req *http.Request) {
-	fmt.Println("Received one request for search")
-
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("Access-Control-Allow-Origin", "*")
-	writer.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
-
-	lat, _ := strconv.ParseFloat(req.URL.Query().Get("lat"), 64)
-	lon, _ := strconv.ParseFloat(req.URL.Query().Get("lon"), 64)
-	// range is optional
-	ran := DISTANCE
-	if val := req.URL.Query().Get("range"); val != "" {
-		ran = val + "km"
-	}
-
-	posts, err := readFromES(lat, lon, ran)
-	if err != nil {
-		http.Error(writer, "Failed to read post from ElasticSearch", http.StatusInternalServerError)
-		fmt.Printf("Failed to read post from ElasticSearch %v.\n", err)
-		return
-	}
-
-	js, err := json.Marshal(posts)
-	if err != nil {
-		http.Error(writer, "Failed to parse posts into JSON format", http.StatusInternalServerError)
-		fmt.Printf("Failed to parse posts into JSON format %v.\n", err)
-		return
-	}
-
-	writer.Write(js)
 }
